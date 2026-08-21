@@ -1695,6 +1695,8 @@ const firebaseConfig = {
 
 let firebaseReady = false;
 let fbDb = null;
+let cloudUnavailable = false;
+const CLOUD_TIMEOUT_MS = 10000;
 try {
   firebase.initializeApp(firebaseConfig);
   fbDb = firebase.firestore();
@@ -1757,24 +1759,30 @@ async function compressImageForCloud(dataUrl, maxSide=1200, quality=0.72){
 async function cloudGet(key){
   if(!firebaseReady || !fbDb) return null;
   try{
-    if(key==='pcr_dual'){
-      const snap=await fbDb.collection('journal_trades').get();
-      if(snap.empty) return null;
-      return snap.docs.map(d=>d.data());
-    }
-    if(key==='pcr_wd'){
-      const snap=await fbDb.collection('journal_withdrawals').get();
-      if(snap.empty) return null;
-      return snap.docs.map(d=>d.data());
-    }
-    if(key==='pcr_bal'){
-      const snap=await fbDb.collection('journal_settings').doc('balances').get();
-      return snap.exists ? (snap.data().value ?? null) : null;
-    }
+    const run = (async()=>{
+      if(key==='pcr_dual'){
+        const snap=await fbDb.collection('journal_trades').get();
+        if(snap.empty) return null;
+        return snap.docs.map(d=>d.data());
+      }
+      if(key==='pcr_wd'){
+        const snap=await fbDb.collection('journal_withdrawals').get();
+        if(snap.empty) return null;
+        return snap.docs.map(d=>d.data());
+      }
+      if(key==='pcr_bal'){
+        const snap=await fbDb.collection('journal_settings').doc('balances').get();
+        return snap.exists ? (snap.data().value ?? null) : null;
+      }
+      return null;
+    })();
+    const timeout = new Promise((_,reject)=>setTimeout(()=>reject(new Error('Firebase timeout')),CLOUD_TIMEOUT_MS));
+    return await Promise.race([run,timeout]);
   }catch(e){
-    console.error('[Firebase] Error leyendo '+key+':',e);
+    cloudUnavailable = true;
+    console.warn('[Firebase] No se pudo leer a tiempo; se continúa con el respaldo local.',e);
+    return null;
   }
-  return null;
 }
 
 async function cloudSet(key,value){
@@ -1885,13 +1893,13 @@ function updateBackupUI(msg,color){const s=document.getElementById('auto-backup-
 let trades = [];
 async function loadAll(){
   const t = await storeGetRaw('pcr_dual');
-  if (t===null) { trades = DEFAULT_TRADES; await storeSet('pcr_dual', trades); }
+  if (t===null) { trades = DEFAULT_TRADES; if(!cloudUnavailable) await storeSet('pcr_dual', trades); }
   else trades = t;
   const b = await storeGetRaw('pcr_bal');
-  if (b===null) { balances = DEFAULT_BALANCES; await storeSet('pcr_bal', balances); }
+  if (b===null) { balances = DEFAULT_BALANCES; if(!cloudUnavailable) await storeSet('pcr_bal', balances); }
   else balances = b;
   const w = await storeGetRaw('pcr_wd');
-  if (w===null) { withdrawals = DEFAULT_WITHDRAWALS; await storeSet('pcr_wd', withdrawals); }
+  if (w===null) { withdrawals = DEFAULT_WITHDRAWALS; if(!cloudUnavailable) await storeSet('pcr_wd', withdrawals); }
   else withdrawals = w;
 }
 let curAcc    = 'a';
@@ -2633,10 +2641,15 @@ document.querySelectorAll('.overlay').forEach(o=>{o.addEventListener('click',e=>
   const ls=ld?ld.querySelector('span'):null;
   if(ls) ls.textContent=firebaseReady?'Conectando con Firebase...':'Cargando datos locales...';
   await restoreLinkedHandle();
-  await loadAll();
-  updateHeader(); updateBalBar(); renderCal(); updateBackupUI();
-  if(ls) ls.textContent=firebaseReady?'✓ Firebase conectado':'✓ Modo local';
-  setTimeout(()=>{if(ld) ld.style.display='none';},250);
+  // No dejamos que una conexión lenta de Firebase deje la pantalla en blanco.
+  const loadPromise = loadAll();
+  await Promise.race([loadPromise, new Promise(r=>setTimeout(r,10500))]);
+  updateHeader(); updateBalBar(); renderCal(); renderLog(); renderStats(); updateBackupUI();
+  if(ld) ld.style.display='none';
+  // Si Firebase terminó después del límite, actualizamos la interfaz sin recargar.
+  loadPromise.then(()=>{
+    updateHeader(); updateBalBar(); renderCal(); renderLog(); renderStats(); updateBackupUI();
+  }).catch(e=>console.warn('[Boot]',e));
 })();
 </script>
 
